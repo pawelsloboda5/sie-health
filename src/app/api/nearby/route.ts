@@ -1,14 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { searchNearbyProviders } from '@/lib/cosmos-db';
+import { searchNearbyProviders, SearchFilters } from '@/lib/cosmos-db';
 
-// T-01: /api/nearby route handler with real Cosmos DB
+// /api/nearby route handler with enhanced filtering
 export async function GET(request: NextRequest) {
   try {
     const searchParams = request.nextUrl.searchParams;
     const lat = searchParams.get('lat');
     const lng = searchParams.get('lng');
-    const km = searchParams.get('km') || '10';
-    const service = searchParams.get('service');
+    const km = searchParams.get('km') || '50'; // Default to 50km for better coverage
 
     // Validate required parameters
     if (!lat || !lng) {
@@ -29,12 +28,25 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // Use the actual Cosmos DB search function
+    // Build filters from query params
+    const filters: SearchFilters = {
+      category: searchParams.get('category') || undefined,
+      insuranceType: searchParams.get('insuranceType') as any || undefined,
+      freeServicesOnly: searchParams.get('freeServicesOnly') === 'true',
+      acceptsUninsured: searchParams.get('acceptsUninsured') === 'true',
+      noDocumentsRequired: searchParams.get('noDocumentsRequired') === 'true',
+      telehealth: searchParams.get('telehealth') === 'true',
+      walkInsAccepted: searchParams.get('walkInsAccepted') === 'true',
+      slidingScale: searchParams.get('slidingScale') === 'true',
+      searchText: searchParams.get('searchText') || undefined,
+    };
+
+    // Use the enhanced search function
     const results = await searchNearbyProviders(
       latitude,
       longitude,
       radius,
-      service || undefined
+      filters
     );
 
     return NextResponse.json(results);

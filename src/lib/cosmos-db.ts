@@ -7,7 +7,7 @@ import { env } from './env';
 let cachedClient: MongoClient | null = null;
 let cachedDb: Db | null = null;
 
-async function connectToDatabase() {
+export async function connectToDatabase() {
   if (cachedClient && cachedDb) {
     return { client: cachedClient, db: cachedDb };
   }
@@ -23,70 +23,107 @@ async function connectToDatabase() {
   return { client, db };
 }
 
+export interface SearchFilters {
+  serviceType?: string;
+  category?: string;
+  insuranceType?: 'medicaid' | 'medicare' | 'self-pay' | 'any';
+  freeServicesOnly?: boolean;
+  acceptsUninsured?: boolean;
+  noDocumentsRequired?: boolean;
+  telehealth?: boolean;
+  walkInsAccepted?: boolean;
+  slidingScale?: boolean;
+  searchText?: string;
+}
+
 export async function searchNearbyProviders(
   latitude: number,
   longitude: number,
   radiusKm: number,
-  serviceFilter?: string
+  filters: SearchFilters = {}
 ) {
   const { db } = await connectToDatabase();
   
-  // Get all collection names
-  const collections = await db.listCollections().toArray();
+  // Now we only have one collection: "businesses"
+  const collection = db.collection('businesses');
   
-  // Filter to only health-related collections (exclude system collections)
-  // Note: Collection names use mixed naming conventions (snake_case and kebab-case)
-  // Examples: dental_clinics, community-health-centers, chronic-disease-screenings
-  const healthCollections = collections
-    .map(c => c.name)
-    .filter(name => !name.startsWith('system.'));
-  
-  // Query all collections in parallel
-  const queries = healthCollections.map(async (collectionName) => {
-    const collection = db.collection(collectionName);
+  // Build the query - MUST have jina_scraped: true
+  const query: any = {
+    jina_scraped: true, // Only show processed documents
     
-    // MongoDB geospatial query with free_services filter
-    const query: any = {
-      // Must have free_services array with at least one element
-      free_services: { $exists: true, $ne: [] },
-      
-      // Geospatial query using 2dsphere index
-      location: {
-        $near: {
-          $geometry: {
-            type: 'Point',
-            coordinates: [longitude, latitude]
-          },
-          $maxDistance: radiusKm * 1000 // Convert km to meters
-        }
+    // Geospatial query using 2dsphere index
+    location: {
+      $near: {
+        $geometry: {
+          type: 'Point',
+          coordinates: [longitude, latitude]
+        },
+        $maxDistance: radiusKm * 1000 // Convert km to meters
       }
-    };
-    
-    // Optional service filter
-    if (serviceFilter) {
-      query['free_services.service'] = {
-        $regex: serviceFilter,
-        $options: 'i' // Case insensitive
-      };
     }
-    
-    // Execute query with limit
-    const results = await collection
-      .find(query)
-      .limit(20) // Limit per collection
-      .toArray();
-    
-    return results;
-  });
+  };
   
-  // Wait for all queries to complete
-  const allResults = await Promise.all(queries);
+  // Apply filters
+  if (filters.category) {
+    query.Category = { $regex: filters.category, $options: 'i' };
+  }
   
-  // Flatten results from all collections
-  const flatResults = allResults.flat();
+  if (filters.freeServicesOnly) {
+    query.$or = [
+      { 'services_offered.general_services.is_free': true },
+      { 'services_offered.specialized_services.is_free': true },
+      { 'services_offered.general_services.is_discounted': true },
+      { 'services_offered.specialized_services.is_discounted': true }
+    ];
+  }
   
-  // Calculate distances and sort
-  const resultsWithDistance = flatResults.map(doc => {
+  if (filters.insuranceType) {
+    switch (filters.insuranceType) {
+      case 'medicaid':
+        query['insurance_accepted.medicaid'] = true;
+        break;
+      case 'medicare':
+        query['insurance_accepted.medicare'] = true;
+        break;
+      case 'self-pay':
+        query['insurance_accepted.self_pay_options'] = true;
+        break;
+    }
+  }
+  
+  if (filters.acceptsUninsured) {
+    query['financial_assistance.accepts_uninsured'] = true;
+  }
+  
+  if (filters.noDocumentsRequired) {
+    query['documentation_requirements.ssn_required'] = false;
+    query['documentation_requirements.id_required'] = false;
+  }
+  
+  if (filters.telehealth) {
+    query['telehealth_info.telehealth_available'] = true;
+  }
+  
+  if (filters.walkInsAccepted) {
+    query['accessibility_info.walk_ins_accepted'] = true;
+  }
+  
+  if (filters.slidingScale) {
+    query['financial_assistance.sliding_scale_available'] = true;
+  }
+  
+  if (filters.searchText) {
+    query.$text = { $search: filters.searchText };
+  }
+  
+  // Execute query
+  const results = await collection
+    .find(query)
+    .limit(50) // Increase limit since we're only querying one collection
+    .toArray();
+  
+  // Calculate distances and extract relevant free services
+  const resultsWithDistance = results.map(doc => {
     const distance = calculateDistance(
       latitude,
       longitude,
@@ -94,17 +131,47 @@ export async function searchNearbyProviders(
       doc.location.coordinates[0]
     );
     
+    // Extract all free/discounted services
+    interface ExtractedService {
+      name: string;
+      category: string;
+      description: string;
+      price_info: string;
+      is_free: boolean;
+      is_discounted: boolean;
+      type: string;
+    }
+    
+    const freeServices: ExtractedService[] = [];
+    
+    if (doc.services_offered) {
+      const serviceTypes = ['general_services', 'specialized_services', 'diagnostic_services'] as const;
+      serviceTypes.forEach(serviceType => {
+        if (doc.services_offered[serviceType]) {
+          doc.services_offered[serviceType].forEach((service: any) => {
+            if (service.is_free || service.is_discounted) {
+              freeServices.push({
+                ...service,
+                type: serviceType
+              });
+            }
+          });
+        }
+      });
+    }
+    
     return {
       ...doc,
       distance: Math.round(distance * 10) / 10,
-      collection: doc.search_keyword || doc.Category // Include source collection info
+      freeServicesCount: freeServices.length,
+      extractedFreeServices: freeServices
     };
   });
   
-  // Sort by distance and limit to 20 total
+  // Sort by distance
   return resultsWithDistance
     .sort((a, b) => a.distance - b.distance)
-    .slice(0, 20);
+    .slice(0, 30); // Return top 30 results
 }
 
 // Haversine formula for distance calculation
